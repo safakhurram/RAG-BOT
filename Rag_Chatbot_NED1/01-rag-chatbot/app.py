@@ -3,6 +3,7 @@
 import ast
 import html
 import json
+import os
 import re
 import tempfile
 from datetime import datetime
@@ -689,8 +690,48 @@ def insights_tab_html(sources: list[dict], total_chunks: int, n_docs: int) -> st
 # The bot answers ONLY from the files uploaded in the sidebar. Every
 # "Build knowledge base" REPLACES the previous knowledge base, so old files
 # (or files from another session) are never mixed in.
+# ---- Deployment options (set as environment variables / Streamlit secrets) ----
+# RAG_FIXED_DOC  path of a PDF bundled in the repo, e.g. data/UGProspectus2025.pdf.
+#                When set, the app loads it at start-up (from the saved OCR cache, so
+#                no OCR happens online) and the upload box is hidden.
+# APP_PASSWORD   if set, visitors must enter it before using the app (protects your
+#                Groq quota on a public link).
+FIXED_DOC = os.getenv("RAG_FIXED_DOC", "").strip()
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+
+if APP_PASSWORD and not st.session_state.get("authed"):
+    st.markdown(f"### {APP_NAME}")
+    entered = st.text_input("Password", type="password")
+    if entered:
+        if entered == APP_PASSWORD:
+            st.session_state.authed = True
+            st.rerun()
+        st.error("Wrong password.")
+    st.stop()
+
+
+@st.cache_resource(show_spinner="Loading the document (first start only)...")
+def get_fixed_pipeline(doc_path: str):
+    """One shared pipeline for all visitors, built once per server start."""
+    pipeline = RAGPipeline()
+    n_chunks = pipeline.load_or_build([doc_path])
+    return pipeline, n_chunks
+
+
+if FIXED_DOC and "pipeline" not in st.session_state:
+    doc_path = Path(FIXED_DOC)
+    if not doc_path.is_absolute():
+        doc_path = Path(__file__).resolve().parent / doc_path
+    pipeline, n_chunks = get_fixed_pipeline(str(doc_path))
+    st.session_state.pipeline = pipeline
+    st.session_state.indexed = True
+    st.session_state.n_chunks = n_chunks
+    st.session_state.doc_files = [(doc_path.name, doc_path.stat().st_size)]
+
 if "pipeline" not in st.session_state:
-    st.session_state.pipeline = RAGPipeline()
+    # own folder per visitor: building an index replaces the collection in its folder,
+    # so a shared folder would let one visitor wipe another visitor's knowledge base
+    st.session_state.pipeline = RAGPipeline(persist_dir=tempfile.mkdtemp(prefix="chroma_"))
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "indexed" not in st.session_state:
@@ -714,36 +755,45 @@ with st.sidebar:
         '<div class="tag">Answers only from your uploaded files</div></div></div>',
         unsafe_allow_html=True,
     )
-    st.markdown('<div class="side-title">Upload documents</div>', unsafe_allow_html=True)
-    uploaded_files = st.file_uploader(
-        "PDF, TXT, or CSV",
-        type=["pdf", "txt", "csv"],
-        accept_multiple_files=True,
-        label_visibility="collapsed",
-    )
-    build = st.button("Build knowledge base", disabled=not uploaded_files)
+    if not FIXED_DOC:  # upload UI is hidden when a document is bundled
+        st.markdown('<div class="side-title">Upload documents</div>', unsafe_allow_html=True)
+        uploaded_files = st.file_uploader(
+            "PDF, TXT, or CSV",
+            type=["pdf", "txt", "csv"],
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+        )
+        build = st.button("Build knowledge base", disabled=not uploaded_files)
 
-    if build:
-        try:
-            with st.spinner("Reading, chunking and indexing (a scanned PDF is OCR'd once, then cached)..."):
-                tmp_dir = Path(tempfile.mkdtemp())
-                paths = []
-                for uploaded in uploaded_files:
-                    dest = tmp_dir / uploaded.name
-                    dest.write_bytes(uploaded.getbuffer())
-                    paths.append(str(dest))
-                n_chunks = st.session_state.pipeline.ingest(paths)  # replaces the old index
-            st.session_state.indexed = True
-            st.session_state.n_chunks = n_chunks
-            st.session_state.doc_files = [(u.name, u.size) for u in uploaded_files]
-            st.session_state.messages = []  # answers about old files no longer apply
-            st.success(f"Indexed {n_chunks} chunks from {len(uploaded_files)} file(s).")
-        except Exception as exc:  # show the cause instead of a raw traceback
-            detail = one_line(f"{type(exc).__name__}: {exc}", limit=300)
-            st.markdown(
-                f'<div class="err"><strong>Could not build the knowledge base.</strong><br>{detail}</div>',
-                unsafe_allow_html=True,
-            )
+        if build:
+            try:
+                progress = st.progress(0.0, text="Starting...")
+
+                def on_progress(stage: str, fraction: float) -> None:
+                    progress.progress(min(max(fraction, 0.0), 1.0) * 0.95, text=stage)
+
+                with st.spinner("Reading, chunking and indexing (a scanned PDF is OCR'd once, then cached)..."):
+                    tmp_dir = Path(tempfile.mkdtemp())
+                    paths = []
+                    for uploaded in uploaded_files:
+                        dest = tmp_dir / uploaded.name
+                        dest.write_bytes(uploaded.getbuffer())
+                        paths.append(str(dest))
+                    n_chunks = st.session_state.pipeline.ingest(paths, on_progress=on_progress)  # replaces the old index
+                progress.empty()
+                st.session_state.indexed = True
+                st.session_state.n_chunks = n_chunks
+                st.session_state.doc_files = [(u.name, u.size) for u in uploaded_files]
+                st.session_state.messages = []  # answers about old files no longer apply
+                st.success(f"Indexed {n_chunks} chunks from {len(uploaded_files)} file(s).")
+                for warning in st.session_state.pipeline.warnings:
+                    st.warning(warning)
+            except Exception as exc:  # show the cause instead of a raw traceback
+                detail = one_line(f"{type(exc).__name__}: {exc}", limit=300)
+                st.markdown(
+                    f'<div class="err"><strong>Could not build the knowledge base.</strong><br>{detail}</div>',
+                    unsafe_allow_html=True,
+                )
 
     st.markdown('<div class="side-title">Knowledge base</div>', unsafe_allow_html=True)
     st.markdown(doc_list_html(st.session_state.doc_files), unsafe_allow_html=True)

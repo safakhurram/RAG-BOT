@@ -27,12 +27,15 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from .chunking import chunk_documents
 from .llm import get_chat_model
-from .loaders import load_files
+from .loaders import load_files, low_confidence_pages
 from .sections import add_sections
 from .verify import locate_quote, normalize, quote_already_shown
 from .vectorstore import KeywordIndex, build_vectorstore, hybrid_search
 
 BOT_NAME = "DocBot"
+
+# Anchored to the app folder so the index/cache do not move with the working directory.
+DEFAULT_PERSIST_DIR = Path(__file__).resolve().parent.parent / "chroma_db"
 
 NOT_INDEXED_MESSAGE = "No documents have been indexed yet. Upload files first."
 NO_MATCH_MESSAGE = "I don't have enough information in the uploaded documents to answer that."
@@ -94,6 +97,10 @@ belongs to (for example which department or programme, and which year). Use it t
 the right block, but never copy it into a quote.
 7. If the answer exists for more than one matching section (for example a department \
 with the same name at the main campus and at another campus), quote each one.
+8. Treat these as the same thing: "chairperson", "chairman", "chair" and "head of \
+department"; "telecom" and "telecommunication". For a question about who holds a role, \
+copy the line with the person's name AND the line with the role or department, even if \
+they are separate lines or in neighbouring blocks.
 
 Context:
 {context}"""
@@ -186,9 +193,9 @@ def _source_dict(doc) -> dict:
 class RAGPipeline:
     def __init__(
         self,
-        persist_dir: str | Path = "./chroma_db",
-        top_k: int = 2,
-        score_threshold: float | None = 0.25,
+        persist_dir: str | Path = DEFAULT_PERSIST_DIR,
+        top_k: int = 5,
+        score_threshold: float | None = 0.15,
         strict: bool | None = None,
     ):
         self.persist_dir = persist_dir
@@ -199,16 +206,19 @@ class RAGPipeline:
         self._keyword_index = None
         # Built lazily so constructing a RAGPipeline never requires an API key.
         self._chat_model = None
+        self.warnings: list[str] = []  # e.g. pages whose scan was hard to read
 
     def _get_chat_model(self):
         if self._chat_model is None:
             self._chat_model = get_chat_model()
         return self._chat_model
 
-    def ingest(self, file_paths: list[str]) -> int:
+    def ingest(self, file_paths: list[str], on_progress=None) -> int:
         """Load, chunk, and embed the given files (replacing anything indexed
-        before). Returns the number of chunks indexed."""
-        docs = load_files(file_paths)
+        before). Returns the number of chunks indexed. `on_progress(stage,
+        fraction)` is called while scanned pages are OCR'd."""
+        docs = load_files(file_paths, on_progress=on_progress)
+        self.warnings = low_confidence_pages(docs)
         chunks = chunk_documents(docs)
         add_sections(docs, chunks)
         if not chunks:
@@ -253,7 +263,7 @@ class RAGPipeline:
         self._keyword_index = KeywordIndex(chunks)
         return len(chunks)
 
-    def _with_next_chunks(self, retrieved, n_best: int = 4):
+    def _with_next_chunks(self, retrieved, n_best: int = 3):
         """Add the chunk that follows each of the best matches, so a table or
         list cut in two by chunking reaches the model whole."""
         if not self._keyword_index or not retrieved:

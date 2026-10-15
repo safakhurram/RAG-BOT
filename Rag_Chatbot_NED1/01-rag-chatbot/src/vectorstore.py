@@ -101,6 +101,21 @@ _ORDINALS = {
 }
 
 
+# Words people type vs. words the prospectus uses. Both search methods use the
+# expanded query, so "telecom" can now find "Telecommunication Engineering".
+_SYNONYMS = {
+    "telecom": "telecommunication",
+    "telecommunications": "telecommunication",
+    "chairperson": "chairman chair",
+    "chairman": "chairperson chair",
+    "chair": "chairperson chairman",
+    "head": "chairperson chairman",
+    "hod": "head of department chairperson chairman",
+    "vc": "vice chancellor",
+    "dept": "department",
+}
+
+
 def expand_query(query: str) -> str:
     """'3 year' / '3rd year' -> also 'third year', as the prospectus writes it."""
     extra = [
@@ -108,7 +123,10 @@ def expand_query(query: str) -> str:
         for m in re.finditer(r"\b(\d(?:st|nd|rd|th)?|final)\s*(?:-\s*)?year", query, re.I)
         if m.group(1).lower() in _ORDINALS
     ]
-    return query + (" " + " ".join(f"{w} year" for w in extra) if extra else "")
+    query = query + (" " + " ".join(f"{w} year" for w in extra) if extra else "")
+    words = set(re.findall(r"[a-z]+", query.lower()))
+    added = [_SYNONYMS[w] for w in sorted(words) if w in _SYNONYMS]
+    return query + (" " + " ".join(added) if added else "")
 
 
 class KeywordIndex:
@@ -139,8 +157,11 @@ def hybrid_search(
     """Reciprocal-rank fusion of vector and keyword results, best first.
     Results are the ORIGINAL chunks (without the section prefix used for search)."""
     query = expand_query(query)
-    vector_hits = search_relevant(vectorstore, query, k, score_threshold)
-    keyword_hits = keyword_index.search(query, k) if keyword_index else []
+    # look wider than k in each method, fuse, THEN cut to k: a chunk ranked 3rd
+    # by both methods now beats one ranked 1st by only one of them
+    pool = max(k * 4, 20)
+    vector_hits = search_relevant(vectorstore, query, pool, score_threshold)
+    keyword_hits = keyword_index.search(query, pool) if keyword_index else []
     if keyword_index:
         originals = {c.metadata.get("chunk_id"): c for c in keyword_index.chunks}
         vector_hits = [originals.get(d.metadata.get("chunk_id"), d) for d in vector_hits]

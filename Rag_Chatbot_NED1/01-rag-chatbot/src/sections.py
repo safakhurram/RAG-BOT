@@ -20,8 +20,17 @@ from langchain_core.documents import Document
 # "3.1.1 | Civil Engineering", "2.2.15 Department of ...", "2.2.29(i) Department ..."
 # Table-of-contents lines end with a page number and are ignored.
 _HEADING = re.compile(
-    r"^(\d+(?:\.\d+)+(?:\s*\([ivx]+\))?)\.?\s*\|?\s*([A-Za-z][^|]{2,100}?)\s*$"
+    r"^(\d+(?:\.\s*\d+)+(?:\s*\([ivx]+\))?)\.?\s*\|?\s*([A-Za-z][^|]{2,100}?)\s*$"
 )
+# OCR sometimes puts a space after a dot ("2.2. 21 Department of ..."); the
+# heading number is stored without such spaces.
+_NUMBER_ONLY = re.compile(r"\d+(?:\.\s*\d+)+(?:\s*\([ivx]+\))?\.?")
+
+
+def _clean_number(number: str) -> str:
+    return re.sub(r"\s+", "", number).rstrip(".")
+
+
 _YEAR = re.compile(r"^(FIRST|SECOND|THIRD|FOURTH|FINAL)\s+YEAR\b.*$", re.I)
 
 
@@ -36,15 +45,15 @@ def _line_sections(pages: list[Document]) -> list[list[str]]:
             is_toc = bool(re.search(r"(\||\s)\d{1,3}\s*$", stripped))
             if pending_number and stripped and not is_toc and re.match(r"^[A-Za-z]", stripped):
                 # "3.1.2" on one line, its title on the next
-                heading, year = f"{pending_number} {stripped.split('|')[0].strip()}", ""
+                heading, year = f"{_clean_number(pending_number)} {stripped.split('|')[0].strip()}", ""
                 pending_number = None
             else:
                 pending_number = None
                 m = _HEADING.match(stripped)
-                if re.fullmatch(r"\d+(?:\.\d+)+(?:\s*\([ivx]+\))?\.?", stripped):
+                if _NUMBER_ONLY.fullmatch(stripped):
                     pending_number = stripped.rstrip(".")
                 elif m and not is_toc:
-                    heading, year = f"{m.group(1)} {m.group(2).strip()}", ""
+                    heading, year = f"{_clean_number(m.group(1))} {m.group(2).strip()}", ""
                 elif _YEAR.match(stripped):
                     year = stripped.split("|")[0].strip().upper()
             labels.append(heading + (f" > {year}" if year and heading else year))

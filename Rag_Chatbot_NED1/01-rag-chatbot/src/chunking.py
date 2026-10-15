@@ -16,8 +16,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 PROSE_SPLITTER = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
     encoding_name="cl100k_base",
-    chunk_size=1000,
-    chunk_overlap=200,
+    chunk_size=500,
+    chunk_overlap=100,
     separators=["\n\n", "\n", ". ", " ", ""],
 )
 
